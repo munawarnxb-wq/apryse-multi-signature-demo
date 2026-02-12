@@ -265,30 +265,19 @@ window.applyApproval = async (instance) => {
     const filename = documentViewer.getDocument().filename
 
     await PDFNet.initialize()
-    const signedBlob = await PDFNet.runWithCleanup(async () => {
-      const doc = await PDFNet.PDFDoc.createFromBuffer(new Uint8Array(data))
-      await doc.initSecurityHandler()
-      const digSigFieldIterator =
-        await doc.getDigitalSignatureFieldIteratorBegin()
-      let foundOneDigitalSignature = false
-      for (
-        digSigFieldIterator;
-        await digSigFieldIterator.hasNext();
-        digSigFieldIterator.next()
-      ) {
-        const field = await digSigFieldIterator.current()
-        if (await field.hasVisibleAppearance()) {
-          foundOneDigitalSignature = true
-          break
-        }
-      }
-      await doc.lock()
-      try {
-      const widgetsToSign = JSON.parse(
-        JSON.stringify(widgetsToDigitallySign)
-      )
+    const pfxArrayBuffer = await digitalID.arrayBuffer()
 
-      if (!widgetsToSign.length) {
+    let currentDocData = data
+    let signedCount = 0
+    const widgetsToSign = JSON.parse(
+      JSON.stringify(widgetsToDigitallySign)
+    )
+    let setDocMDPForNext = true
+
+    if (!widgetsToSign.length) {
+      const signedBlob = await PDFNet.runWithCleanup(async () => {
+        const doc = await PDFNet.PDFDoc.createFromBuffer(new Uint8Array(data))
+        await doc.initSecurityHandler()
         const fieldName = 'Signature1-invisible'
         const field = await doc.fieldCreate(
           fieldName,
@@ -305,81 +294,93 @@ window.applyApproval = async (instance) => {
         const widgetObj = await widgetAnnot.getSDFObj()
         widgetObj.putNumber('F', 132)
         widgetObj.putName('Type', 'Annot')
-        widgetsToSign.push({ label: fieldName })
-      }
-
-      const visited = []
-      let buf
-      let signedCount = 0
-      let setDocMDPForNext = !(await hasDigitalSignaturesInDoc(doc, PDFNet))
-
+        await doc.lock()
+        try {
+          const pfxCopy = pfxArrayBuffer.slice(0)
+          const sigField =
+            await PDFNet.DigitalSignatureField.createFromField(field)
+          await sigField.setDocumentPermissions(
+            PDFNet.DigitalSignatureField.DocumentPermissions[
+              UIElements.selectedDocumentPermission
+            ]
+          )
+          await sigField.signOnNextSaveFromBuffer(
+            pfxCopy,
+            UIElements.password
+          )
+          await sigField.setLocation(UIElements.signatureInformation[0].value)
+          await sigField.setReason(UIElements.signatureInformation[1].value)
+          await sigField.setContactInfo(UIElements.signatureInformation[2].value)
+          const buf = await doc.saveMemoryBuffer(
+            PDFNet.SDFDoc.SaveOptions.e_incremental
+          )
+          return new Blob([buf], { type: 'application/pdf' })
+        } finally {
+          await doc.unlock()
+        }
+      })
+      currentDocData = await signedBlob.arrayBuffer()
+      signedCount = 1
+    } else {
       for (let i = 0; i < widgetsToSign.length; i++) {
         const widgetFieldName = widgetsToSign[i].label
-        let field
-        if (typeof doc.getField === 'function') {
-          field = await doc.getField(widgetFieldName)
-        } else {
-          const fieldIterator = await doc.getFieldIteratorBegin()
-          for (
-            ;
-            await fieldIterator.hasNext();
-            fieldIterator.next()
-          ) {
-            const f = await fieldIterator.current()
-            if (
-              !(await f.isValid()) ||
-              (await f.getType()) !== PDFNet.Field.Type.e_signature
-            ) continue
-            const fieldName = await f.getName()
-            if (fieldName === widgetFieldName && !visited.includes(fieldName)) {
-              visited.push(fieldName)
-              field = f
-              break
-            }
-          }
-        }
-        if (!field) {
-          throw Error('The document does not contain a signature field')
-        }
-        const sigField =
-          await PDFNet.DigitalSignatureField.createFromField(field)
-        if (await sigField.hasCryptographicSignature()) continue
-        visited.push(widgetFieldName)
-        signedCount++
-        if (setDocMDPForNext) {
-          const perm = UIElements.selectedDocumentPermission
-          await sigField.setDocumentPermissions(
-            PDFNet.DigitalSignatureField.DocumentPermissions[perm]
+        const passData = currentDocData.slice(0)
+        const pfxCopy = pfxArrayBuffer.slice(0)
+        const isFirstSign = setDocMDPForNext
+        const signedBlob = await PDFNet.runWithCleanup(async () => {
+          const doc = await PDFNet.PDFDoc.createFromBuffer(
+            new Uint8Array(passData)
           )
+          await doc.initSecurityHandler()
+          const field = await doc.getField(widgetFieldName)
+          if (!field) return null
+          const sigField =
+            await PDFNet.DigitalSignatureField.createFromField(field)
+          if (await sigField.hasCryptographicSignature()) return null
+          await doc.lock()
+          try {
+            if (isFirstSign) {
+              const hasExisting = await hasDigitalSignaturesInDoc(doc, PDFNet)
+              if (!hasExisting) {
+                await sigField.setDocumentPermissions(
+                  PDFNet.DigitalSignatureField.DocumentPermissions[
+                    UIElements.selectedDocumentPermission
+                  ]
+                )
+              }
+            }
+            await sigField.signOnNextSaveFromBuffer(
+              pfxCopy,
+              UIElements.password
+            )
+            await sigField.setLocation(UIElements.signatureInformation[0].value)
+            await sigField.setReason(UIElements.signatureInformation[1].value)
+            await sigField.setContactInfo(
+              UIElements.signatureInformation[2].value
+            )
+            const buf = await doc.saveMemoryBuffer(
+              PDFNet.SDFDoc.SaveOptions.e_incremental
+            )
+            return new Blob([buf], { type: 'application/pdf' })
+          } finally {
+            await doc.unlock()
+          }
+        })
+        if (signedBlob) {
+          signedCount++
           setDocMDPForNext = false
+          currentDocData = await signedBlob.arrayBuffer()
         }
+      }
+    }
 
-        // Worker detaches buffer on postMessage transfer; get fresh buffer each time to avoid reuse
-        const pfxArrayBuffer = await digitalID.arrayBuffer()
-        const pfxCopy = new ArrayBuffer(pfxArrayBuffer.byteLength)
-        new Uint8Array(pfxCopy).set(new Uint8Array(pfxArrayBuffer))
-        await sigField.signOnNextSaveFromBuffer(
-          pfxCopy,
-          UIElements.password
-        )
-        await sigField.setLocation(UIElements.signatureInformation[0].value)
-        await sigField.setReason(UIElements.signatureInformation[1].value)
-        await sigField.setContactInfo(UIElements.signatureInformation[2].value)
+    if (signedCount === 0) {
+      throw Error(
+        'All selected signature fields are already signed. Add a new signature field and draw on it first.'
+      )
+    }
 
-        buf = await doc.saveMemoryBuffer(
-          PDFNet.SDFDoc.SaveOptions.e_incremental
-        )
-      }
-      if (signedCount === 0) {
-        throw Error(
-          'All selected signature fields are already signed. Add a new signature field and draw on it first.'
-        )
-      }
-      return new Blob([buf], { type: 'application/pdf' })
-      } finally {
-        await doc.unlock()
-      }
-    })
+    const signedBlob = new Blob([currentDocData], { type: 'application/pdf' })
 
     if (UIElements.addToTrustedList && digitalID) {
       const pfxBuf = await digitalID.arrayBuffer()
