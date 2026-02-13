@@ -422,9 +422,8 @@ window.downloadSignedDocument = async (instance) => {
     return
   }
   try {
-    const xfdfString = await annotationManager.exportAnnotations()
+    // Download without xfdfString to preserve signatures (merging XFDF invalidates them in Adobe Acrobat)
     const data = await doc.getFileData({
-      xfdfString,
       flags: SaveOptions.INCREMENTAL
     })
     const blob = new Blob([data], { type: 'application/pdf' })
